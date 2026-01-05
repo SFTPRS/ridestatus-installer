@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v2.0.3
+# Version: v2.0.4
 # =============================================================================
-INSTALLER_VERSION="v2.0.3"
+INSTALLER_VERSION="v2.0.4"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -143,29 +143,39 @@ echo "Sudoers validation passed."
 # -----------------------------------------------------------------------------
 SSH_DIR="$HOME/.ssh"
 KEY_FILE="$SSH_DIR/id_ed25519"
+PUB_FILE="${KEY_FILE}.pub"
 
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-if [[ ! -f "$KEY_FILE" ]]; then
+if [[ ! -f "$KEY_FILE" || ! -f "$PUB_FILE" ]]; then
   echo "Generating SSH key..."
+  rm -f "$KEY_FILE" "$PUB_FILE"
   ssh-keygen -t ed25519 -f "$KEY_FILE" -N ""
 fi
 
 chmod 600 "$KEY_FILE"
-chmod 644 "${KEY_FILE}.pub"
+chmod 644 "$PUB_FILE"
 
+# Ensure GitHub host key is present
 ssh-keyscan -H github.com 2>/dev/null | sort -u > "$SSH_DIR/known_hosts"
 chmod 600 "$SSH_DIR/known_hosts"
+
+# Compute fingerprint (safe to share)
+PUB_FPR="$(ssh-keygen -lf "$PUB_FILE" -E sha256 | awk '{print $2}' || true)"
 
 echo
 echo "=============================="
 echo "GITHUB SSH KEY (ADD TO USER)"
 echo "=============================="
-cat "${KEY_FILE}.pub"
+cat "$PUB_FILE"
+echo
+echo "Public key fingerprint (SHA256): ${PUB_FPR:-unknown}"
 echo
 echo "Add the above public key to your GitHub USER account:"
 echo "  GitHub -> Settings -> SSH and GPG keys -> New SSH key"
+echo
+echo "Tip: When sharing logs, you can redact the public key line and keep the fingerprint."
 
 echo
 echo "Testing GitHub SSH connectivity (non-fatal)..."
@@ -508,3 +518,5 @@ echo "Install log:  ${LOG_FILE}"
 echo "DB env:       ${DB_ENV_FILE}"
 echo "Repos:        ${SRC_DIR}"
 echo "Sudo mode:    NOPASSWD enabled for 'sftp'"
+echo "SSH key fpr:  ${PUB_FPR:-unknown}"
+echo "SSH key file: ${PUB_FILE}"
