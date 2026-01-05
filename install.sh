@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v2.0.2
+# Version: v2.0.3
 # =============================================================================
-INSTALLER_VERSION="v2.0.2"
+INSTALLER_VERSION="v2.0.3"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -48,12 +48,16 @@ if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
 fi
 echo "OS check passed."
 
-echo "Checking sudo access (initial run may prompt for password)..."
-if ! sudo -v; then
-  echo "ERROR: 'sftp' must have sudo privileges."
+# NOPASSWD model: never prompt. Fail fast if sudo would prompt.
+echo "Checking sudo access (non-interactive; must be NOPASSWD)..."
+if ! sudo -n true 2>/dev/null; then
+  echo "ERROR: sudo is not passwordless for user 'sftp'."
+  echo "       Ensure 'sftp' can run sudo without a password."
+  echo "       Expected sudoers line:"
+  echo "         sftp ALL=(ALL) NOPASSWD:ALL"
   exit 1
 fi
-echo "Sudo check passed."
+echo "Sudo check passed (NOPASSWD)."
 
 # -----------------------------------------------------------------------------
 # Disk check / optional auto-expand (LVM)
@@ -113,15 +117,7 @@ echo "Installer version: ${INSTALLER_VERSION}"
 # -----------------------------------------------------------------------------
 # Enforce passwordless sudo for sftp (NOPASSWD by default)
 # -----------------------------------------------------------------------------
-echo "Configuring passwordless sudo (NOPASSWD) for user 'sftp'..."
-
-if id -nG sftp | tr ' ' '\n' | grep -qx sudo; then
-  echo "User 'sftp' is already in sudo group."
-else
-  echo "Adding 'sftp' to sudo group..."
-  sudo usermod -aG sudo sftp
-  echo "NOTE: Group membership changes typically require log out/in to take effect for new shells."
-fi
+echo "Ensuring passwordless sudo (NOPASSWD) is configured for user 'sftp'..."
 
 SUDOERS_FILE="/etc/sudoers.d/ridestatus-sftp"
 SUDOERS_LINE="sftp ALL=(ALL) NOPASSWD:ALL"
@@ -159,7 +155,6 @@ fi
 chmod 600 "$KEY_FILE"
 chmod 644 "${KEY_FILE}.pub"
 
-# Ensure GitHub host key is present
 ssh-keyscan -H github.com 2>/dev/null | sort -u > "$SSH_DIR/known_hosts"
 chmod 600 "$SSH_DIR/known_hosts"
 
@@ -169,13 +164,9 @@ echo "GITHUB SSH KEY (ADD TO USER)"
 echo "=============================="
 cat "${KEY_FILE}.pub"
 echo
-echo "Add the above public key to your *GitHub USER account*:"
+echo "Add the above public key to your GitHub USER account:"
 echo "  GitHub -> Settings -> SSH and GPG keys -> New SSH key"
-echo
-echo "NOTE: GitHub user SSH keys are not read-only. Our installer/deploy process will"
-echo "      only do fetch/pull (no pushes) on park servers."
 
-# Quick connectivity probe (non-fatal)
 echo
 echo "Testing GitHub SSH connectivity (non-fatal)..."
 set +e
@@ -318,7 +309,7 @@ echo "DB setup complete: ${DB_NAME}"
 echo "DB credentials file: ${DB_ENV_FILE}"
 
 # -----------------------------------------------------------------------------
-# Migration runner (SQL-file based)
+# Migration runner
 # -----------------------------------------------------------------------------
 MIGRATE_SCRIPT="${BIN_DIR}/ridestatus-migrate.sh"
 sudo tee "$MIGRATE_SCRIPT" >/dev/null <<'EOF'
@@ -401,7 +392,7 @@ sudo systemctl enable ridestatus-migrate
 sudo systemctl restart ridestatus-migrate || true
 
 # -----------------------------------------------------------------------------
-# Node-RED install + credentialSecret enforcement
+# Node-RED + credentialSecret
 # -----------------------------------------------------------------------------
 if ! command -v node-red >/dev/null 2>&1; then
   echo "Installing Node-RED via npm (global)..."
@@ -429,10 +420,6 @@ NR_SETTINGS_FILE="${NODE_RED_USERDIR}/settings.js"
 if [[ ! -f "$NR_SETTINGS_FILE" ]]; then
   echo "Creating Node-RED settings.js with credentialSecret..."
   cat > "$NR_SETTINGS_FILE" <<EOF
-/**
- * RideStatus managed settings.js
- * Managed by installer ${INSTALLER_VERSION}
- */
 module.exports = {
     credentialSecret: '${secret}',
 };
@@ -452,7 +439,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Clone private repos (uses GitHub USER SSH key)
+# Clone repos (user SSH key model)
 # -----------------------------------------------------------------------------
 echo
 echo "Cloning/updating repos into ${SRC_DIR} from org ${GITHUB_ORG}..."
@@ -475,7 +462,7 @@ for repo in "${REPOS[@]}"; do
   else
     echo "Cloning ${repo}..."
     if ! (cd "$SRC_DIR" && git clone "$url" "$dest"); then
-      echo "WARNING: clone failed for ${repo} (repo missing or key not authorized for your user/org)"
+      echo "WARNING: clone failed for ${repo}"
     fi
   fi
 done
@@ -483,9 +470,6 @@ done
 # -----------------------------------------------------------------------------
 # Node-RED systemd service
 # -----------------------------------------------------------------------------
-echo
-echo "Configuring systemd service: ridestatus-nodered.service"
-
 sudo tee /etc/systemd/system/ridestatus-nodered.service >/dev/null <<'EOF'
 [Unit]
 Description=RideStatus Node-RED
@@ -510,9 +494,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable ridestatus-nodered
 sudo systemctl restart ridestatus-nodered
 
-# -----------------------------------------------------------------------------
-# Completion
-# -----------------------------------------------------------------------------
 IP_ADDR="$(hostname -I | awk '{print $1}' || true)"
 if [[ -z "${IP_ADDR:-}" ]]; then IP_ADDR="127.0.0.1"; fi
 
@@ -527,6 +508,3 @@ echo "Install log:  ${LOG_FILE}"
 echo "DB env:       ${DB_ENV_FILE}"
 echo "Repos:        ${SRC_DIR}"
 echo "Sudo mode:    NOPASSWD enabled for 'sftp'"
-echo
-echo "Reminder: This install uses the GitHub USER SSH key model."
-echo "Ensure the printed SSH key is added to your GitHub user account SSH keys."
