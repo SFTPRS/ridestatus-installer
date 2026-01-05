@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v2.0.4
+# Version: v2.0.5
 # =============================================================================
-INSTALLER_VERSION="v2.0.4"
+INSTALLER_VERSION="v2.0.5"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -52,7 +52,6 @@ echo "OS check passed."
 echo "Checking sudo access (non-interactive; must be NOPASSWD)..."
 if ! sudo -n true 2>/dev/null; then
   echo "ERROR: sudo is not passwordless for user 'sftp'."
-  echo "       Ensure 'sftp' can run sudo without a password."
   echo "       Expected sudoers line:"
   echo "         sftp ALL=(ALL) NOPASSWD:ALL"
   exit 1
@@ -157,11 +156,9 @@ fi
 chmod 600 "$KEY_FILE"
 chmod 644 "$PUB_FILE"
 
-# Ensure GitHub host key is present
 ssh-keyscan -H github.com 2>/dev/null | sort -u > "$SSH_DIR/known_hosts"
 chmod 600 "$SSH_DIR/known_hosts"
 
-# Compute fingerprint (safe to share)
 PUB_FPR="$(ssh-keygen -lf "$PUB_FILE" -E sha256 | awk '{print $2}' || true)"
 
 echo
@@ -179,9 +176,16 @@ echo "Tip: When sharing logs, you can redact the public key line and keep the fi
 
 echo
 echo "Testing GitHub SSH connectivity (non-fatal)..."
+ssh_out=""
 set +e
-ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 | sed 's/^/[ssh] /'
+ssh_out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1)"
+ssh_rc=$?
 set -e
+# Print without using a pipe (avoid pipefail surprises)
+while IFS= read -r line; do
+  echo "[ssh] $line"
+done <<<"$ssh_out"
+echo "[ssh] exit code: ${ssh_rc} (ignored)"
 
 # -----------------------------------------------------------------------------
 # GitHub org config (default: SFTPRS)
@@ -214,7 +218,6 @@ fi
 # -----------------------------------------------------------------------------
 echo
 echo "Installing Node-RED, Mosquitto, Ansible, MariaDB..."
-
 sudo apt-get install -y \
   nodejs \
   npm \
