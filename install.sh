@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v2.0.6
+# Version: v2.0.7
 # =============================================================================
-INSTALLER_VERSION="v2.0.6"
+INSTALLER_VERSION="v2.0.7"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -107,6 +107,7 @@ sudo mkdir -p "$CONFIG_DIR" "$BACKUPS_DIR" "$LOG_DIR" "$BIN_DIR" "$SRC_DIR"
 sudo chown -R sftp:sftp "$RIDESTATUS_ROOT"
 sudo chmod 0755 "$RIDESTATUS_ROOT" "$CONFIG_DIR" "$BACKUPS_DIR" "$LOG_DIR" "$BIN_DIR" "$SRC_DIR"
 
+# Append buffered log and switch to final log file
 cat "$TMP_LOG_FILE" | tee -a "$LOG_FILE" >/dev/null
 exec > >(tee -a "$LOG_FILE") 2>&1
 rm -rf "$TMP_LOG_DIR"
@@ -120,7 +121,10 @@ echo "Installer version: ${INSTALLER_VERSION}"
 SUDOERS_FILE="/etc/sudoers.d/ridestatus-sftp"
 SUDOERS_LINE="sftp ALL=(ALL) NOPASSWD:ALL"
 
-if ! sudo test -f "$SUDOERS_FILE"; then
+if sudo test -f "$SUDOERS_FILE" && sudo grep -Fxq "$SUDOERS_LINE" "$SUDOERS_FILE"; then
+  echo "NOPASSWD already configured in $SUDOERS_FILE"
+else
+  echo "Writing $SUDOERS_FILE"
   sudo tee "$SUDOERS_FILE" >/dev/null <<EOF
 # Managed by RideStatus installer (${INSTALLER_VERSION})
 ${SUDOERS_LINE}
@@ -128,6 +132,7 @@ EOF
   sudo chmod 0440 "$SUDOERS_FILE"
 fi
 
+echo "Validating sudoers configuration..."
 sudo visudo -cf /etc/sudoers >/dev/null
 echo "Sudoers validation passed."
 
@@ -142,6 +147,8 @@ mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
 if [[ ! -f "$KEY_FILE" || ! -f "$PUB_FILE" ]]; then
+  echo "Generating SSH key..."
+  rm -f "$KEY_FILE" "$PUB_FILE"
   ssh-keygen -t ed25519 -f "$KEY_FILE" -N ""
 fi
 
@@ -151,7 +158,7 @@ chmod 644 "$PUB_FILE"
 ssh-keyscan -H github.com 2>/dev/null | sort -u > "$SSH_DIR/known_hosts"
 chmod 600 "$SSH_DIR/known_hosts"
 
-PUB_FPR="$(ssh-keygen -lf "$PUB_FILE" -E sha256 | awk '{print $2}')"
+PUB_FPR="$(ssh-keygen -lf "$PUB_FILE" -E sha256 | awk '{print $2}' || true)"
 
 echo
 echo "=============================="
@@ -159,7 +166,7 @@ echo "GITHUB SSH KEY (ADD TO USER)"
 echo "=============================="
 cat "$PUB_FILE"
 echo
-echo "Public key fingerprint (SHA256): $PUB_FPR"
+echo "Public key fingerprint (SHA256): ${PUB_FPR:-unknown}"
 echo
 echo "Add the above public key to your GitHub USER account:"
 echo "  GitHub -> Settings -> SSH and GPG keys -> New SSH key"
@@ -167,16 +174,17 @@ echo
 echo "Tip: When sharing logs, redact the key but keep the fingerprint."
 
 # -----------------------------------------------------------------------------
-# GitHub SSH connectivity test (NON-FATAL, TIME-BOUNDED)
+# GitHub SSH connectivity test (NON-FATAL, TIME-BOUNDED, DOES NOT CONSUME STDIN)
 # -----------------------------------------------------------------------------
 echo
 echo "Testing GitHub SSH connectivity (optional; non-fatal)..."
 set +e
-timeout 8s ssh \
+# IMPORTANT: </dev/null (and -n) prevents ssh from consuming the remainder of this script
+timeout 8s ssh -n \
   -o BatchMode=yes \
   -o StrictHostKeyChecking=yes \
   -o ConnectTimeout=5 \
-  -T git@github.com 2>&1 || true
+  -T git@github.com </dev/null 2>&1
 ssh_rc=$?
 set -e
 echo "[ssh] exit code: ${ssh_rc} (ignored; GitHub commonly returns 1)"
@@ -191,11 +199,13 @@ if [[ -n "${RIDESTATUS_GITHUB_ORG:-}" ]]; then
   GITHUB_ORG="$RIDESTATUS_GITHUB_ORG"
 else
   if [[ -f "$GITHUB_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
     source "$GITHUB_ENV_FILE"
     GITHUB_ORG="${GITHUB_ORG:-$DEFAULT_ORG}"
   else
     GITHUB_ORG="$DEFAULT_ORG"
-    echo "GITHUB_ORG=\"$GITHUB_ORG\"" > "$GITHUB_ENV_FILE"
+    echo "GITHUB_ORG=\"${GITHUB_ORG}\"" > "$GITHUB_ENV_FILE"
+    chmod 0644 "$GITHUB_ENV_FILE"
   fi
 fi
 
@@ -220,6 +230,7 @@ sudo apt-get install -y \
 # -----------------------------------------------------------------------------
 # Mosquitto
 # -----------------------------------------------------------------------------
+echo "Configuring Mosquitto (listen on all interfaces)..."
 sudo tee /etc/mosquitto/conf.d/ridestatus.conf >/dev/null <<'EOF'
 listener 1883 0.0.0.0
 allow_anonymous true
@@ -230,40 +241,56 @@ sudo systemctl restart mosquitto
 # -----------------------------------------------------------------------------
 # MariaDB
 # -----------------------------------------------------------------------------
+echo "Ensuring MariaDB is enabled and running..."
 sudo systemctl enable mariadb
 sudo systemctl restart mariadb
 
 # -----------------------------------------------------------------------------
-# Database setup
+# Database setup (idempotent)
 # -----------------------------------------------------------------------------
 DB_ENV_FILE="${CONFIG_DIR}/db.env"
 
 if [[ ! -f "$DB_ENV_FILE" ]]; then
+  echo "Generating DB credentials..."
   cat > "$DB_ENV_FILE" <<EOF
+# Managed by RideStatus installer (${INSTALLER_VERSION})
 DB_NAME=ridestatus
 DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_APP_USER=ridestatus_app
-DB_APP_PASS=$(openssl rand -base64 32)
+DB_APP_PASS=$(openssl rand -base64 32 | tr -d '\n')
 DB_MIGRATE_USER=ridestatus_migrate
-DB_MIGRATE_PASS=$(openssl rand -base64 32)
+DB_MIGRATE_PASS=$(openssl rand -base64 32 | tr -d '\n')
 EOF
-  chmod 600 "$DB_ENV_FILE"
+  chmod 0600 "$DB_ENV_FILE"
 fi
 
+# shellcheck disable=SC1090
 source "$DB_ENV_FILE"
 
-sudo mysql <<SQL
-CREATE DATABASE IF NOT EXISTS ${DB_NAME};
+echo "Creating database and users (idempotent)..."
+sudo mysql --protocol=socket <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
-GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_MIGRATE_USER}'@'localhost';
-GRANT SELECT,INSERT,UPDATE,DELETE ON ${DB_NAME}.* TO '${DB_APP_USER}'@'localhost';
+
+GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
+  ON \`${DB_NAME}\`.*
+  TO '${DB_APP_USER}'@'localhost';
+
+GRANT ALL PRIVILEGES
+  ON \`${DB_NAME}\`.*
+  TO '${DB_MIGRATE_USER}'@'localhost';
+
 FLUSH PRIVILEGES;
 SQL
 
+echo "DB setup complete: ${DB_NAME}"
+echo "DB credentials file: ${DB_ENV_FILE}"
+
 # -----------------------------------------------------------------------------
-# Clone repos (THIS NOW ALWAYS RUNS)
+# Clone repos
 # -----------------------------------------------------------------------------
 echo
 echo "Cloning/updating repos into ${SRC_DIR}..."
@@ -280,25 +307,44 @@ for repo in "${REPOS[@]}"; do
 
   if [[ -d "$dest/.git" ]]; then
     echo "Updating $repo..."
-    (cd "$dest" && git pull --ff-only) || echo "WARNING: update failed for $repo"
+    (cd "$dest" && git fetch --all --prune) || { echo "WARNING: fetch failed for $repo"; continue; }
+    (cd "$dest" && git checkout -q main) || true
+    (cd "$dest" && git pull -q --ff-only) || true
   else
     echo "Cloning $repo..."
-    (cd "$SRC_DIR" && git clone "$url") || echo "WARNING: clone failed for $repo"
+    if ! (cd "$SRC_DIR" && git clone "$url" "$dest"); then
+      echo "WARNING: clone failed for $repo"
+    fi
   fi
 done
 
 # -----------------------------------------------------------------------------
+# Node-RED install (ensure command exists)
+# -----------------------------------------------------------------------------
+if ! command -v node-red >/dev/null 2>&1; then
+  echo "Installing Node-RED via npm (global)..."
+  sudo npm install -g --unsafe-perm node-red
+fi
+
+# -----------------------------------------------------------------------------
 # Node-RED systemd service
 # -----------------------------------------------------------------------------
+echo "Configuring systemd service: ridestatus-nodered.service"
 sudo tee /etc/systemd/system/ridestatus-nodered.service >/dev/null <<'EOF'
 [Unit]
 Description=RideStatus Node-RED
 After=network.target mosquitto.service mariadb.service
+Wants=mosquitto.service mariadb.service
 
 [Service]
+Type=simple
 User=sftp
+Group=sftp
+WorkingDirectory=/home/sftp
 ExecStart=/usr/bin/env node-red -u /home/sftp/.node-red
 Restart=on-failure
+RestartSec=5
+Environment=NODE_OPTIONS=--max-old-space-size=256
 
 [Install]
 WantedBy=multi-user.target
@@ -308,10 +354,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable ridestatus-nodered
 sudo systemctl restart ridestatus-nodered
 
-# -----------------------------------------------------------------------------
-# Done
-# -----------------------------------------------------------------------------
-IP="$(hostname -I | awk '{print $1}')"
+IP="$(hostname -I | awk '{print $1}' || true)"
+[[ -n "${IP:-}" ]] || IP="127.0.0.1"
 
 echo
 echo "======================================"
@@ -321,4 +365,4 @@ echo "Node-RED URL: http://${IP}:1880"
 echo "MQTT Broker:  mqtt://${IP}:1883"
 echo "Install log:  ${LOG_FILE}"
 echo "Repos:        ${SRC_DIR}"
-echo "SSH key fpr:  ${PUB_FPR}"
+echo "SSH key fpr:  ${PUB_FPR:-unknown}"
