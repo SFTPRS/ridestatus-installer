@@ -176,7 +176,7 @@ timeout 8s ssh \
   -o BatchMode=yes \
   -o StrictHostKeyChecking=yes \
   -o ConnectTimeout=5 \
-  -T git@github.com 2>&1
+  -T git@github.com 2>&1 || true
 ssh_rc=$?
 set -e
 echo "[ssh] exit code: ${ssh_rc} (ignored; GitHub commonly returns 1)"
