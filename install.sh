@@ -15,8 +15,9 @@ set -euo pipefail
 #   - Creates users for localhost, 127.0.0.1, and ::1
 #   - Forces passwords to match db.env on EVERY run (fixes rerun drift)
 # - Verifies Node-RED runtime environment via /proc/$pid/environ (non-secret)
+# - FIX: repo clone/update loop syntax (v2.0.11 had a stray `done`)
 # =============================================================================
-INSTALLER_VERSION="v2.0.11"
+INSTALLER_VERSION="v2.0.12"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before /opt/ridestatus exists)
@@ -261,8 +262,6 @@ sudo systemctl restart mariadb
 DB_ENV_FILE="${CONFIG_DIR}/db.env"
 
 ensure_db_env_normalized() {
-  # Load existing values if present (supports older quoted files too),
-  # then rewrite in systemd-safe KEY=VALUE format to ensure continuity.
   if [[ -f "$DB_ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     set -a
@@ -283,7 +282,6 @@ ensure_db_env_normalized() {
     DB_MIGRATE_PASS="$(openssl rand -base64 48 | tr -d '\n')"
   fi
 
-  # Write in systemd-safe format (NO quotes, NO export, NO spaces)
   sudo tee "$DB_ENV_FILE" >/dev/null <<EOF
 # Managed by RideStatus installer (${INSTALLER_VERSION})
 DB_NAME=${DB_NAME}
@@ -295,7 +293,6 @@ DB_MIGRATE_USER=${DB_MIGRATE_USER}
 DB_MIGRATE_PASS=${DB_MIGRATE_PASS}
 EOF
 
-  # Security: readable by root + sftp group (Node-RED runs as sftp); not world-readable
   sudo chown root:sftp "$DB_ENV_FILE"
   sudo chmod 640 "$DB_ENV_FILE"
 }
@@ -317,7 +314,6 @@ echo "Creating database and users (idempotent, passwords enforced)..."
 sudo mysql --protocol=socket <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- Create accounts for IPv4/IPv6/socket cases
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'::1' IDENTIFIED BY '${DB_APP_PASS}';
@@ -326,7 +322,6 @@ CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_M
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'::1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
--- Enforce passwords every run (fixes rerun drift)
 ALTER USER '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 ALTER USER '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
 ALTER USER '${DB_APP_USER}'@'::1' IDENTIFIED BY '${DB_APP_PASS}';
@@ -335,26 +330,19 @@ ALTER USER '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 ALTER USER '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 ALTER USER '${DB_MIGRATE_USER}'@'::1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
--- Grants (repeat-safe)
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
-  ON \`${DB_NAME}\`.*
-  TO '${DB_APP_USER}'@'localhost';
+  ON \`${DB_NAME}\`.* TO '${DB_APP_USER}'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
-  ON \`${DB_NAME}\`.*
-  TO '${DB_APP_USER}'@'127.0.0.1';
+  ON \`${DB_NAME}\`.* TO '${DB_APP_USER}'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
-  ON \`${DB_NAME}\`.*
-  TO '${DB_APP_USER}'@'::1';
+  ON \`${DB_NAME}\`.* TO '${DB_APP_USER}'@'::1';
 
 GRANT ALL PRIVILEGES
-  ON \`${DB_NAME}\`.*
-  TO '${DB_MIGRATE_USER}'@'localhost';
+  ON \`${DB_NAME}\`.* TO '${DB_MIGRATE_USER}'@'localhost';
 GRANT ALL PRIVILEGES
-  ON \`${DB_NAME}\`.*
-  TO '${DB_MIGRATE_USER}'@'127.0.0.1';
+  ON \`${DB_NAME}\`.* TO '${DB_MIGRATE_USER}'@'127.0.0.1';
 GRANT ALL PRIVILEGES
-  ON \`${DB_NAME}\`.*
-  TO '${DB_MIGRATE_USER}'@'::1';
+  ON \`${DB_NAME}\`.* TO '${DB_MIGRATE_USER}'@'::1';
 
 FLUSH PRIVILEGES;
 SQL
@@ -363,7 +351,7 @@ echo "DB setup complete: ${DB_NAME}"
 echo "DB credentials file: ${DB_ENV_FILE}"
 
 # -----------------------------------------------------------------------------
-# Clone repos
+# Clone repos (FIXED LOOP)
 # -----------------------------------------------------------------------------
 echo
 echo "Cloning/updating repos into ${SRC_DIR}..."
@@ -388,7 +376,7 @@ for repo in "${REPOS[@]}"; do
     if ! (cd "$SRC_DIR" && git clone "$url" "$dest"); then
       echo "WARNING: clone failed for $repo"
     fi
-  done
+  fi
 done
 
 # -----------------------------------------------------------------------------
@@ -438,7 +426,6 @@ ExecStart=/usr/bin/env node-red -u /home/sftp/.node-red
 Restart=on-failure
 RestartSec=5
 Environment=NODE_OPTIONS=--max-old-space-size=256
-# Load RideStatus DB config so Function nodes (process.env) and other tools can use DB_* vars
 EnvironmentFile=/opt/ridestatus/config/db.env
 
 [Install]
@@ -486,5 +473,5 @@ echo "DB env file (used by services + Node-RED):"
 echo "  /opt/ridestatus/config/db.env"
 echo
 echo "MySQL node tip:"
-echo "  This installer creates users and grants for localhost, 127.0.0.1, and ::1."
-echo "  It also enforces passwords on every run to match db.env."
+echo "  This installer creates users/grants for localhost, 127.0.0.1, and ::1,"
+echo "  and enforces passwords on every run to match db.env."
