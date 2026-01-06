@@ -418,14 +418,21 @@ sudo systemctl restart ridestatus-nodered
 # -----------------------------------------------------------------------------
 # Non-secret verification that Node-RED service sees DB env vars
 # -----------------------------------------------------------------------------
-echo "Verifying Node-RED service environment contains DB_NAME (non-secret check)..."
-if sudo systemctl show ridestatus-nodered -p Environment | tr ' ' '\n' | grep -q '^DB_NAME='; then
-  echo "OK: DB_NAME present in ridestatus-nodered environment."
+echo "Verifying Node-RED process environment contains DB_NAME (non-secret check)..."
+
+pid="$(sudo systemctl show ridestatus-nodered -p ExecMainPID | cut -d= -f2)"
+if [[ -z "$pid" || "$pid" == "0" ]]; then
+  echo "WARNING: ridestatus-nodered is not running (ExecMainPID=$pid)."
+  sudo systemctl status ridestatus-nodered --no-pager -l || true
 else
-  echo "WARNING: DB_NAME NOT present in ridestatus-nodered environment."
-  echo "         This usually means db.env formatting isn't systemd-friendly."
-  echo "         Expected: KEY=VALUE (no quotes). Actual file:"
-  sudo sed -n '1,120p' /opt/ridestatus/config/db.env | sed 's/DB_.*PASS=.*/DB_***PASS=[redacted]/g'
+  if sudo tr '\0' '\n' < "/proc/${pid}/environ" | grep -q '^DB_NAME='; then
+    echo "OK: DB_NAME present in ridestatus-nodered runtime environment."
+  else
+    echo "WARNING: DB_NAME NOT present in ridestatus-nodered runtime environment."
+    echo "         EnvironmentFile is configured, but vars did not reach the process."
+    echo "         EnvironmentFiles reported by systemd:"
+    sudo systemctl show ridestatus-nodered -p EnvironmentFiles || true
+  fi
 fi
 
 IP="$(hostname -I | awk '{print $1}' || true)"
