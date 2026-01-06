@@ -11,11 +11,12 @@ set -euo pipefail
 # - Ensures ridestatus-nodered.service loads DB env via EnvironmentFile=
 # - Installs required Node-RED palette deps (node-red-node-mysql)
 # - Ensures /home/sftp/.node-red exists and has package.json before npm install
-# - Fixes MariaDB auth mismatch: creates/grants users for BOTH 'localhost' and '127.0.0.1'
-#   so Node-RED can connect using host 127.0.0.1 without ER_ACCESS_DENIED_ERROR
+# - Bulletproof MariaDB auth:
+#   - Creates users for localhost, 127.0.0.1, and ::1
+#   - Forces passwords to match db.env on EVERY run (fixes rerun drift)
 # - Verifies Node-RED runtime environment via /proc/$pid/environ (non-secret)
 # =============================================================================
-INSTALLER_VERSION="v2.0.10"
+INSTALLER_VERSION="v2.0.11"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before /opt/ridestatus exists)
@@ -310,34 +311,50 @@ source "$DB_ENV_FILE"
 set +a
 
 # -----------------------------------------------------------------------------
-# Database setup (idempotent) + FIX localhost vs 127.0.0.1 user matching
+# Database setup (idempotent) + BULLETPROOF password continuity
 # -----------------------------------------------------------------------------
-echo "Creating database and users (idempotent)..."
+echo "Creating database and users (idempotent, passwords enforced)..."
 sudo mysql --protocol=socket <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- Ensure accounts exist for BOTH localhost and 127.0.0.1 to avoid ER_ACCESS_DENIED_ERROR
+-- Create accounts for IPv4/IPv6/socket cases
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
+CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'::1' IDENTIFIED BY '${DB_APP_PASS}';
 
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'::1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
+-- Enforce passwords every run (fixes rerun drift)
+ALTER USER '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
+ALTER USER '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
+ALTER USER '${DB_APP_USER}'@'::1' IDENTIFIED BY '${DB_APP_PASS}';
+
+ALTER USER '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+ALTER USER '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+ALTER USER '${DB_MIGRATE_USER}'@'::1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+
+-- Grants (repeat-safe)
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
   ON \`${DB_NAME}\`.*
   TO '${DB_APP_USER}'@'localhost';
-
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
   ON \`${DB_NAME}\`.*
   TO '${DB_APP_USER}'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
+  ON \`${DB_NAME}\`.*
+  TO '${DB_APP_USER}'@'::1';
 
 GRANT ALL PRIVILEGES
   ON \`${DB_NAME}\`.*
   TO '${DB_MIGRATE_USER}'@'localhost';
-
 GRANT ALL PRIVILEGES
   ON \`${DB_NAME}\`.*
   TO '${DB_MIGRATE_USER}'@'127.0.0.1';
+GRANT ALL PRIVILEGES
+  ON \`${DB_NAME}\`.*
+  TO '${DB_MIGRATE_USER}'@'::1';
 
 FLUSH PRIVILEGES;
 SQL
@@ -371,7 +388,7 @@ for repo in "${REPOS[@]}"; do
     if ! (cd "$SRC_DIR" && git clone "$url" "$dest"); then
       echo "WARNING: clone failed for $repo"
     fi
-  fi
+  done
 done
 
 # -----------------------------------------------------------------------------
@@ -469,5 +486,5 @@ echo "DB env file (used by services + Node-RED):"
 echo "  /opt/ridestatus/config/db.env"
 echo
 echo "MySQL node tip:"
-echo "  If Host is set to 127.0.0.1 in Node-RED, this installer grants users for 127.0.0.1."
-echo "  If Host is set to localhost, it will also work."
+echo "  This installer creates users and grants for localhost, 127.0.0.1, and ::1."
+echo "  It also enforces passwords on every run to match db.env."
