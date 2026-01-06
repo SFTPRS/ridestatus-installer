@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Version: v2.0.7
+# Version: v2.0.8
 # =============================================================================
-INSTALLER_VERSION="v2.0.7"
+INSTALLER_VERSION="v2.0.8"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before sudo is available)
@@ -179,7 +179,6 @@ echo "Tip: When sharing logs, redact the key but keep the fingerprint."
 echo
 echo "Testing GitHub SSH connectivity (optional; non-fatal)..."
 set +e
-# IMPORTANT: </dev/null (and -n) prevents ssh from consuming the remainder of this script
 timeout 8s ssh -n \
   -o BatchMode=yes \
   -o StrictHostKeyChecking=yes \
@@ -254,15 +253,18 @@ if [[ ! -f "$DB_ENV_FILE" ]]; then
   echo "Generating DB credentials..."
   cat > "$DB_ENV_FILE" <<EOF
 # Managed by RideStatus installer (${INSTALLER_VERSION})
-DB_NAME=ridestatus
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_APP_USER=ridestatus_app
-DB_APP_PASS=$(openssl rand -base64 32 | tr -d '\n')
-DB_MIGRATE_USER=ridestatus_migrate
-DB_MIGRATE_PASS=$(openssl rand -base64 32 | tr -d '\n')
+DB_NAME="ridestatus"
+DB_HOST="127.0.0.1"
+DB_PORT="3306"
+DB_APP_USER="ridestatus_app"
+DB_APP_PASS="$(openssl rand -base64 32 | tr -d '\n')"
+DB_MIGRATE_USER="ridestatus_migrate"
+DB_MIGRATE_PASS="$(openssl rand -base64 32 | tr -d '\n')"
 EOF
   chmod 0600 "$DB_ENV_FILE"
+else
+  # Ensure it's not world-readable (some older versions may have been looser)
+  chmod 0600 "$DB_ENV_FILE" || true
 fi
 
 # shellcheck disable=SC1090
@@ -326,20 +328,31 @@ if ! command -v node-red >/dev/null 2>&1; then
   sudo npm install -g --unsafe-perm node-red
 fi
 
+# -----------------------------------------------------------------------------
+# Ensure Node-RED userDir exists and is npm-initialized
+# -----------------------------------------------------------------------------
+NR_USERDIR="/home/sftp/.node-red"
+echo "Ensuring Node-RED userDir exists: ${NR_USERDIR}"
+mkdir -p "$NR_USERDIR"
+chown -R sftp:sftp "$NR_USERDIR"
+
+if [[ ! -f "${NR_USERDIR}/package.json" ]]; then
+  echo "Initializing ${NR_USERDIR}/package.json (npm init)..."
+  (cd "$NR_USERDIR" && npm init -y >/dev/null)
+fi
+
+# -----------------------------------------------------------------------------
+# Install required Node-RED palette nodes (runtime dependencies)
+# -----------------------------------------------------------------------------
 echo "Installing required Node-RED nodes..."
-
-cd /home/sftp/.node-red
-
-npm install \
-  node-red-node-mysql
-
+(cd "$NR_USERDIR" && npm install node-red-node-mysql)
 echo "Node-RED nodes installed."
 
 # -----------------------------------------------------------------------------
 # Node-RED systemd service
 # -----------------------------------------------------------------------------
 echo "Configuring systemd service: ridestatus-nodered.service"
-sudo tee /etc/systemd/system/ridestatus-nodered.service >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/ridestatus-nodered.service >/dev/null <<EOF
 [Unit]
 Description=RideStatus Node-RED
 After=network.target mosquitto.service mariadb.service
@@ -354,6 +367,8 @@ ExecStart=/usr/bin/env node-red -u /home/sftp/.node-red
 Restart=on-failure
 RestartSec=5
 Environment=NODE_OPTIONS=--max-old-space-size=256
+# Load RideStatus DB config so nodes (e.g., MySQL) can use \${DB_*} variables
+EnvironmentFile=/opt/ridestatus/config/db.env
 
 [Install]
 WantedBy=multi-user.target
@@ -375,3 +390,9 @@ echo "MQTT Broker:  mqtt://${IP}:1883"
 echo "Install log:  ${LOG_FILE}"
 echo "Repos:        ${SRC_DIR}"
 echo "SSH key fpr:  ${PUB_FPR:-unknown}"
+echo
+echo "DB env file loaded into Node-RED service:"
+echo "  /opt/ridestatus/config/db.env"
+echo "In Node-RED, configure the MySQL node with:"
+echo "  Host: \${DB_HOST}  Port: \${DB_PORT}  DB: \${DB_NAME}"
+echo "  User: \${DB_APP_USER}  Pass: \${DB_APP_PASS}"
