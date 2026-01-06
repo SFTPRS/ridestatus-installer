@@ -326,6 +326,15 @@ if ! command -v node-red >/dev/null 2>&1; then
   sudo npm install -g --unsafe-perm node-red
 fi
 
+echo "Installing required Node-RED nodes..."
+
+cd /home/sftp/.node-red
+
+npm install \
+  node-red-node-mysql
+
+echo "Node-RED nodes installed."
+
 # -----------------------------------------------------------------------------
 # Node-RED systemd service
 # -----------------------------------------------------------------------------
