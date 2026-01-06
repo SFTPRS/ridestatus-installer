@@ -3,15 +3,19 @@ set -euo pipefail
 
 # =============================================================================
 # Ride Status Installer
-# Full drop-in replacement with improvements:
-# - Ensures Node-RED palette dependency: node-red-node-mysql
-# - Ensures Node-RED service loads /opt/ridestatus/config/db.env via EnvironmentFile=
-# - Normalizes db.env to SYSTEMD-SAFE format (no quotes, no export, no spaces)
-#   while preserving existing credentials for continuity across installs
-# - Ensures /home/sftp/.node-red exists + has package.json before npm installs
-# - Adds non-secret verification that Node-RED service sees DB_NAME in env
+# Drop-in replacement (corrected + hardened)
+#
+# Key fixes/improvements:
+# - Writes/normalizes /opt/ridestatus/config/db.env in systemd-safe KEY=VALUE format
+#   (preserves existing credentials across reruns)
+# - Ensures ridestatus-nodered.service loads DB env via EnvironmentFile=
+# - Installs required Node-RED palette deps (node-red-node-mysql)
+# - Ensures /home/sftp/.node-red exists and has package.json before npm install
+# - Fixes MariaDB auth mismatch: creates/grants users for BOTH 'localhost' and '127.0.0.1'
+#   so Node-RED can connect using host 127.0.0.1 without ER_ACCESS_DENIED_ERROR
+# - Verifies Node-RED runtime environment via /proc/$pid/environ (non-secret)
 # =============================================================================
-INSTALLER_VERSION="v2.0.9"
+INSTALLER_VERSION="v2.0.10"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before /opt/ridestatus exists)
@@ -251,12 +255,13 @@ sudo systemctl enable mariadb
 sudo systemctl restart mariadb
 
 # -----------------------------------------------------------------------------
-# Database env file (idempotent + NORMALIZED for systemd)
+# DB env file (idempotent + normalized for systemd EnvironmentFile=)
 # -----------------------------------------------------------------------------
 DB_ENV_FILE="${CONFIG_DIR}/db.env"
 
 ensure_db_env_normalized() {
-  # Load existing values if present (quoted or unquoted), then rewrite unquoted.
+  # Load existing values if present (supports older quoted files too),
+  # then rewrite in systemd-safe KEY=VALUE format to ensure continuity.
   if [[ -f "$DB_ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     set -a
@@ -277,7 +282,7 @@ ensure_db_env_normalized() {
     DB_MIGRATE_PASS="$(openssl rand -base64 48 | tr -d '\n')"
   fi
 
-  # Write in systemd-safe format (NO quotes)
+  # Write in systemd-safe format (NO quotes, NO export, NO spaces)
   sudo tee "$DB_ENV_FILE" >/dev/null <<EOF
 # Managed by RideStatus installer (${INSTALLER_VERSION})
 DB_NAME=${DB_NAME}
@@ -289,44 +294,56 @@ DB_MIGRATE_USER=${DB_MIGRATE_USER}
 DB_MIGRATE_PASS=${DB_MIGRATE_PASS}
 EOF
 
-  # Readable by root + sftp group (service runs as sftp); not world readable
+  # Security: readable by root + sftp group (Node-RED runs as sftp); not world-readable
   sudo chown root:sftp "$DB_ENV_FILE"
   sudo chmod 640 "$DB_ENV_FILE"
 }
 
 echo "Ensuring DB env file exists and is normalized for systemd..."
 ensure_db_env_normalized
+echo "DB env file: ${DB_ENV_FILE}"
 
-# Load normalized values for the remainder of the installer
+# Load normalized values for remainder of script
 # shellcheck disable=SC1090
 set -a
 source "$DB_ENV_FILE"
 set +a
 
-echo "DB env file: ${DB_ENV_FILE}"
-
 # -----------------------------------------------------------------------------
-# Database setup (idempotent)
+# Database setup (idempotent) + FIX localhost vs 127.0.0.1 user matching
 # -----------------------------------------------------------------------------
 echo "Creating database and users (idempotent)..."
 sudo mysql --protocol=socket <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+-- Ensure accounts exist for BOTH localhost and 127.0.0.1 to avoid ER_ACCESS_DENIED_ERROR
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
+CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
+
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
   ON \`${DB_NAME}\`.*
   TO '${DB_APP_USER}'@'localhost';
 
+GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
+  ON \`${DB_NAME}\`.*
+  TO '${DB_APP_USER}'@'127.0.0.1';
+
 GRANT ALL PRIVILEGES
   ON \`${DB_NAME}\`.*
   TO '${DB_MIGRATE_USER}'@'localhost';
+
+GRANT ALL PRIVILEGES
+  ON \`${DB_NAME}\`.*
+  TO '${DB_MIGRATE_USER}'@'127.0.0.1';
 
 FLUSH PRIVILEGES;
 SQL
 
 echo "DB setup complete: ${DB_NAME}"
+echo "DB credentials file: ${DB_ENV_FILE}"
 
 # -----------------------------------------------------------------------------
 # Clone repos
@@ -366,7 +383,7 @@ if ! command -v node-red >/dev/null 2>&1; then
 fi
 
 # -----------------------------------------------------------------------------
-# Ensure Node-RED userDir exists and is npm-initialized
+# Ensure Node-RED userDir exists and is npm-initialized (needed for palette installs)
 # -----------------------------------------------------------------------------
 NR_USERDIR="/home/sftp/.node-red"
 echo "Ensuring Node-RED userDir exists: ${NR_USERDIR}"
@@ -379,7 +396,7 @@ if [[ ! -f "${NR_USERDIR}/package.json" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Install required Node-RED palette nodes (runtime dependencies)
+# Install required Node-RED palette nodes
 # -----------------------------------------------------------------------------
 echo "Installing required Node-RED nodes (palette deps)..."
 (cd "$NR_USERDIR" && npm install node-red-node-mysql)
@@ -404,7 +421,7 @@ ExecStart=/usr/bin/env node-red -u /home/sftp/.node-red
 Restart=on-failure
 RestartSec=5
 Environment=NODE_OPTIONS=--max-old-space-size=256
-# Load RideStatus DB config so nodes (e.g., MySQL) can use \${DB_*} variables
+# Load RideStatus DB config so Function nodes (process.env) and other tools can use DB_* vars
 EnvironmentFile=/opt/ridestatus/config/db.env
 
 [Install]
@@ -416,10 +433,9 @@ sudo systemctl enable ridestatus-nodered
 sudo systemctl restart ridestatus-nodered
 
 # -----------------------------------------------------------------------------
-# Non-secret verification that Node-RED service sees DB env vars
+# Verify Node-RED runtime env contains DB_NAME (non-secret)
 # -----------------------------------------------------------------------------
 echo "Verifying Node-RED process environment contains DB_NAME (non-secret check)..."
-
 pid="$(sudo systemctl show ridestatus-nodered -p ExecMainPID | cut -d= -f2)"
 if [[ -z "$pid" || "$pid" == "0" ]]; then
   echo "WARNING: ridestatus-nodered is not running (ExecMainPID=$pid)."
@@ -429,9 +445,10 @@ else
     echo "OK: DB_NAME present in ridestatus-nodered runtime environment."
   else
     echo "WARNING: DB_NAME NOT present in ridestatus-nodered runtime environment."
-    echo "         EnvironmentFile is configured, but vars did not reach the process."
-    echo "         EnvironmentFiles reported by systemd:"
+    echo "EnvironmentFiles (systemd):"
     sudo systemctl show ridestatus-nodered -p EnvironmentFiles || true
+    echo "db.env head (passwords redacted):"
+    sudo sed -n '1,120p' /opt/ridestatus/config/db.env | sed 's/DB_.*PASS=.*/DB_***PASS=[redacted]/g'
   fi
 fi
 
@@ -451,6 +468,6 @@ echo
 echo "DB env file (used by services + Node-RED):"
 echo "  /opt/ridestatus/config/db.env"
 echo
-echo "In Node-RED, configure the MySQL node with env vars:"
-echo "  Host: \${DB_HOST}  Port: \${DB_PORT}  DB: \${DB_NAME}"
-echo "  User: \${DB_APP_USER}  Pass: \${DB_APP_PASS}"
+echo "MySQL node tip:"
+echo "  If Host is set to 127.0.0.1 in Node-RED, this installer grants users for 127.0.0.1."
+echo "  If Host is set to localhost, it will also work."
