@@ -4,17 +4,18 @@ set -euo pipefail
 # =============================================================================
 # RideStatus Installer (drop-in replacement)
 #
-# What this version hardens/fixes:
-# - Idempotent, rerunnable (preserves DB creds in /opt/ridestatus/config/db.env)
-# - systemd-safe db.env (KEY=VALUE, no quotes/exports/spaces)
-# - Node-RED runs as user sftp and loads DB env via EnvironmentFile=
-# - Installs Node-RED MySQL palette node (node-red-node-mysql)
-# - MariaDB users created for localhost, 127.0.0.1, and ::1 (IPv4+IPv6 bulletproof)
-# - Enforces user passwords on every run to match db.env (ALTER USER … IDENTIFIED BY)
-# - Prints clear guidance if there are 0 rides (so codebook import can 404 cleanly)
-# - Robust GitHub SSH key handling + optional connectivity check
+# Key features:
+# - Idempotent / rerunnable (preserves DB creds across reruns)
+# - Writes/normalizes /opt/ridestatus/config/db.env in systemd-safe KEY=VALUE format
+# - Node-RED systemd service loads DB env via EnvironmentFile=
+# - Installs Node-RED palette deps:
+#     - node-red-node-mysql
+#     - node-red-contrib-uibuilder
+# - MariaDB users created for localhost, 127.0.0.1, ::1 (IPv4+IPv6 bulletproof)
+# - Enforces passwords on every run to match db.env (ALTER USER ... IDENTIFIED BY)
+# - Warns if there are 0 rides (so codebook import returns clean 404 until UI creates rides)
 # =============================================================================
-INSTALLER_VERSION="v2.0.13"
+INSTALLER_VERSION="v2.0.14"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before /opt/ridestatus exists)
@@ -178,9 +179,6 @@ cat "$PUB_FILE"
 echo
 echo "Public key fingerprint (SHA256): ${PUB_FPR:-unknown}"
 echo
-echo "Add the above public key to your GitHub USER account:"
-echo "  GitHub -> Settings -> SSH and GPG keys -> New SSH key"
-echo
 
 # Optional, non-fatal connectivity test (does not consume STDIN)
 echo "Testing GitHub SSH connectivity (optional; non-fatal)..."
@@ -322,7 +320,7 @@ CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_M
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'::1'       IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
--- Enforce passwords on every run to match db.env (handles reruns / manual edits)
+-- Enforce passwords on every run to match db.env
 ALTER USER '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 ALTER USER '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
 ALTER USER '${DB_APP_USER}'@'::1'       IDENTIFIED BY '${DB_APP_PASS}';
@@ -402,7 +400,7 @@ fi
 NR_USERDIR="/home/sftp/.node-red"
 echo "Ensuring Node-RED userDir exists: ${NR_USERDIR}"
 mkdir -p "$NR_USERDIR"
-chown -R sftp:sftp "$NR_USERDIR"
+sudo chown -R sftp:sftp "$NR_USERDIR"
 
 if [[ ! -f "${NR_USERDIR}/package.json" ]]; then
   echo "Initializing ${NR_USERDIR}/package.json (npm init -y)..."
@@ -413,7 +411,7 @@ fi
 # Install required Node-RED palette nodes
 # -----------------------------------------------------------------------------
 echo "Installing required Node-RED nodes (palette deps)..."
-(cd "$NR_USERDIR" && npm install node-red-node-mysql)
+(cd "$NR_USERDIR" && npm install node-red-node-mysql node-red-contrib-uibuilder)
 echo "Node-RED nodes installed."
 echo
 
@@ -475,7 +473,7 @@ RIDES_COUNT="$(sudo mysql --protocol=socket -N -e "SELECT COUNT(*) FROM \`${DB_N
 if [[ "${RIDES_COUNT}" == "0" ]]; then
   echo "WARNING: Database currently has 0 rides."
   echo "Codebook import/apply will (correctly) return HTTP 404 if ride_id does not exist."
-  echo "Create rides via your Web UI (recommended) or insert them into \`${DB_NAME}\`.rides."
+  echo "Create rides via the Web UI (uibuilder) or insert them into \`${DB_NAME}\`.rides."
 fi
 echo
 
@@ -486,14 +484,11 @@ echo "======================================"
 echo "INSTALLER COMPLETE – ${INSTALLER_VERSION}"
 echo "======================================"
 echo "Node-RED URL: http://${IP}:1880"
+echo "Node-RED UIBuilder: http://${IP}:1880/ (uibuilder endpoints appear under their chosen URL)"
 echo "MQTT Broker:  mqtt://${IP}:1883"
 echo "Install log:  ${LOG_FILE}"
 echo "Repos:        ${SRC_DIR}"
 echo "SSH key fpr:  ${PUB_FPR:-unknown}"
 echo
-echo "DB env file (used by services + Node-RED):"
+echo "DB env file:"
 echo "  /opt/ridestatus/config/db.env"
-echo
-echo "MySQL node tip:"
-echo "  This installer creates users/grants for localhost, 127.0.0.1, and ::1,"
-echo "  and enforces passwords on every run to match db.env."
