@@ -2,22 +2,19 @@
 set -euo pipefail
 
 # =============================================================================
-# Ride Status Installer
-# Drop-in replacement (corrected + hardened)
+# RideStatus Installer (drop-in replacement)
 #
-# Key fixes/improvements:
-# - Writes/normalizes /opt/ridestatus/config/db.env in systemd-safe KEY=VALUE format
-#   (preserves existing credentials across reruns)
-# - Ensures ridestatus-nodered.service loads DB env via EnvironmentFile=
-# - Installs required Node-RED palette deps (node-red-node-mysql)
-# - Ensures /home/sftp/.node-red exists and has package.json before npm install
-# - Bulletproof MariaDB auth:
-#   - Creates users for localhost, 127.0.0.1, and ::1
-#   - Forces passwords to match db.env on EVERY run (fixes rerun drift)
-# - Verifies Node-RED runtime environment via /proc/$pid/environ (non-secret)
-# - FIX: repo clone/update loop syntax (v2.0.11 had a stray `done`)
+# What this version hardens/fixes:
+# - Idempotent, rerunnable (preserves DB creds in /opt/ridestatus/config/db.env)
+# - systemd-safe db.env (KEY=VALUE, no quotes/exports/spaces)
+# - Node-RED runs as user sftp and loads DB env via EnvironmentFile=
+# - Installs Node-RED MySQL palette node (node-red-node-mysql)
+# - MariaDB users created for localhost, 127.0.0.1, and ::1 (IPv4+IPv6 bulletproof)
+# - Enforces user passwords on every run to match db.env (ALTER USER … IDENTIFIED BY)
+# - Prints clear guidance if there are 0 rides (so codebook import can 404 cleanly)
+# - Robust GitHub SSH key handling + optional connectivity check
 # =============================================================================
-INSTALLER_VERSION="v2.0.12"
+INSTALLER_VERSION="v2.0.13"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before /opt/ridestatus exists)
@@ -75,6 +72,7 @@ echo "Sudo check passed (NOPASSWD)."
 # -----------------------------------------------------------------------------
 # Disk check / optional auto-expand (LVM)
 # -----------------------------------------------------------------------------
+# Docs can say "60GB recommended", but allow >=55GB due to OS overhead.
 RECOMMENDED_ROOT_GB=55
 ROOT_GB="$(df -BG --output=size / | tail -1 | tr -d ' G')"
 
@@ -87,7 +85,7 @@ if (( ROOT_GB < RECOMMENDED_ROOT_GB )); then
     sudo resize2fs "$ROOT_SRC"
     df -h /
   else
-    echo "Re-run with --auto-expand-root to expand automatically."
+    echo "Re-run with --auto-expand-root to expand automatically (LVM only)."
   fi
 fi
 
@@ -183,12 +181,8 @@ echo
 echo "Add the above public key to your GitHub USER account:"
 echo "  GitHub -> Settings -> SSH and GPG keys -> New SSH key"
 echo
-echo "Tip: When sharing logs, redact the key but keep the fingerprint."
 
-# -----------------------------------------------------------------------------
-# GitHub SSH connectivity test (NON-FATAL, TIME-BOUNDED, DOES NOT CONSUME STDIN)
-# -----------------------------------------------------------------------------
-echo
+# Optional, non-fatal connectivity test (does not consume STDIN)
 echo "Testing GitHub SSH connectivity (optional; non-fatal)..."
 set +e
 timeout 8s ssh -n \
@@ -199,6 +193,7 @@ timeout 8s ssh -n \
 ssh_rc=$?
 set -e
 echo "[ssh] exit code: ${ssh_rc} (ignored; GitHub commonly returns 1)"
+echo
 
 # -----------------------------------------------------------------------------
 # GitHub org config
@@ -223,7 +218,7 @@ fi
 echo "Using GitHub org: $GITHUB_ORG"
 
 # -----------------------------------------------------------------------------
-# Core services
+# Core packages/services
 # -----------------------------------------------------------------------------
 echo "Installing Node-RED prerequisites, Mosquitto, Ansible, MariaDB..."
 sudo apt-get install -y \
@@ -262,6 +257,7 @@ sudo systemctl restart mariadb
 DB_ENV_FILE="${CONFIG_DIR}/db.env"
 
 ensure_db_env_normalized() {
+  # Load existing values if present (supports older quoted files too)
   if [[ -f "$DB_ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     set -a
@@ -282,6 +278,7 @@ ensure_db_env_normalized() {
     DB_MIGRATE_PASS="$(openssl rand -base64 48 | tr -d '\n')"
   fi
 
+  # Write systemd-safe format (NO quotes, NO export, NO spaces)
   sudo tee "$DB_ENV_FILE" >/dev/null <<EOF
 # Managed by RideStatus installer (${INSTALLER_VERSION})
 DB_NAME=${DB_NAME}
@@ -293,6 +290,7 @@ DB_MIGRATE_USER=${DB_MIGRATE_USER}
 DB_MIGRATE_PASS=${DB_MIGRATE_PASS}
 EOF
 
+  # readable by root + sftp group (Node-RED runs as sftp); not world-readable
   sudo chown root:sftp "$DB_ENV_FILE"
   sudo chmod 640 "$DB_ENV_FILE"
 }
@@ -308,52 +306,61 @@ source "$DB_ENV_FILE"
 set +a
 
 # -----------------------------------------------------------------------------
-# Database setup (idempotent) + BULLETPROOF password continuity
+# Database setup (idempotent) + IPv4/IPv6 bulletproof users + enforce passwords
 # -----------------------------------------------------------------------------
 echo "Creating database and users (idempotent, passwords enforced)..."
 sudo mysql --protocol=socket <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+-- Create users for localhost, 127.0.0.1, and ::1 (IPv4+IPv6 safe)
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
-CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'::1' IDENTIFIED BY '${DB_APP_PASS}';
+CREATE USER IF NOT EXISTS '${DB_APP_USER}'@'::1'       IDENTIFIED BY '${DB_APP_PASS}';
 
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
-CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'::1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+CREATE USER IF NOT EXISTS '${DB_MIGRATE_USER}'@'::1'       IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
+-- Enforce passwords on every run to match db.env (handles reruns / manual edits)
 ALTER USER '${DB_APP_USER}'@'localhost' IDENTIFIED BY '${DB_APP_PASS}';
 ALTER USER '${DB_APP_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_APP_PASS}';
-ALTER USER '${DB_APP_USER}'@'::1' IDENTIFIED BY '${DB_APP_PASS}';
+ALTER USER '${DB_APP_USER}'@'::1'       IDENTIFIED BY '${DB_APP_PASS}';
 
 ALTER USER '${DB_MIGRATE_USER}'@'localhost' IDENTIFIED BY '${DB_MIGRATE_PASS}';
 ALTER USER '${DB_MIGRATE_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
-ALTER USER '${DB_MIGRATE_USER}'@'::1' IDENTIFIED BY '${DB_MIGRATE_PASS}';
+ALTER USER '${DB_MIGRATE_USER}'@'::1'       IDENTIFIED BY '${DB_MIGRATE_PASS}';
 
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
-  ON \`${DB_NAME}\`.* TO '${DB_APP_USER}'@'localhost';
+  ON \`${DB_NAME}\`.*
+  TO '${DB_APP_USER}'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
-  ON \`${DB_NAME}\`.* TO '${DB_APP_USER}'@'127.0.0.1';
+  ON \`${DB_NAME}\`.*
+  TO '${DB_APP_USER}'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES
-  ON \`${DB_NAME}\`.* TO '${DB_APP_USER}'@'::1';
+  ON \`${DB_NAME}\`.*
+  TO '${DB_APP_USER}'@'::1';
 
 GRANT ALL PRIVILEGES
-  ON \`${DB_NAME}\`.* TO '${DB_MIGRATE_USER}'@'localhost';
+  ON \`${DB_NAME}\`.*
+  TO '${DB_MIGRATE_USER}'@'localhost';
 GRANT ALL PRIVILEGES
-  ON \`${DB_NAME}\`.* TO '${DB_MIGRATE_USER}'@'127.0.0.1';
+  ON \`${DB_NAME}\`.*
+  TO '${DB_MIGRATE_USER}'@'127.0.0.1';
 GRANT ALL PRIVILEGES
-  ON \`${DB_NAME}\`.* TO '${DB_MIGRATE_USER}'@'::1';
+  ON \`${DB_NAME}\`.*
+  TO '${DB_MIGRATE_USER}'@'::1';
 
 FLUSH PRIVILEGES;
 SQL
 
 echo "DB setup complete: ${DB_NAME}"
 echo "DB credentials file: ${DB_ENV_FILE}"
+echo
 
 # -----------------------------------------------------------------------------
-# Clone repos (FIXED LOOP)
+# Clone/update repos
 # -----------------------------------------------------------------------------
-echo
 echo "Cloning/updating repos into ${SRC_DIR}..."
 
 REPOS=(
@@ -378,6 +385,8 @@ for repo in "${REPOS[@]}"; do
     fi
   fi
 done
+
+echo
 
 # -----------------------------------------------------------------------------
 # Node-RED install (ensure command exists)
@@ -406,6 +415,7 @@ fi
 echo "Installing required Node-RED nodes (palette deps)..."
 (cd "$NR_USERDIR" && npm install node-red-node-mysql)
 echo "Node-RED nodes installed."
+echo
 
 # -----------------------------------------------------------------------------
 # Node-RED systemd service (RideStatus)
@@ -455,11 +465,23 @@ else
     sudo sed -n '1,120p' /opt/ridestatus/config/db.env | sed 's/DB_.*PASS=.*/DB_***PASS=[redacted]/g'
   fi
 fi
+echo
+
+# -----------------------------------------------------------------------------
+# Guidance: codebook import requires rides.ride_id to exist (FK) -> allow flow to 404 cleanly
+# -----------------------------------------------------------------------------
+echo "Checking rides table..."
+RIDES_COUNT="$(sudo mysql --protocol=socket -N -e "SELECT COUNT(*) FROM \`${DB_NAME}\`.rides;" 2>/dev/null || echo "0")"
+if [[ "${RIDES_COUNT}" == "0" ]]; then
+  echo "WARNING: Database currently has 0 rides."
+  echo "Codebook import/apply will (correctly) return HTTP 404 if ride_id does not exist."
+  echo "Create rides via your Web UI (recommended) or insert them into \`${DB_NAME}\`.rides."
+fi
+echo
 
 IP="$(hostname -I | awk '{print $1}' || true)"
 [[ -n "${IP:-}" ]] || IP="127.0.0.1"
 
-echo
 echo "======================================"
 echo "INSTALLER COMPLETE – ${INSTALLER_VERSION}"
 echo "======================================"
