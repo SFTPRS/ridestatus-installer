@@ -398,7 +398,7 @@ run_db_migrations() {
     return 0
   fi
 
-  echo "Ensuring schema_migrations table exists..."
+  echo "Ensuring schema_migrations table exists (and upgrading if needed)..."
   MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
     --host="${DB_HOST}" --port="${DB_PORT}" \
     --user="${DB_MIGRATE_USER}" \
@@ -410,6 +410,91 @@ run_db_migrations() {
         applied_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       ) ENGINE=InnoDB;
     "
+
+  # If schema_migrations exists but lacks migration_id, upgrade it safely.
+  local has_migration_id
+  has_migration_id="$(MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+    --host="${DB_HOST}" --port="${DB_PORT}" \
+    --user="${DB_MIGRATE_USER}" \
+    --database="${DB_NAME}" \
+    --protocol=tcp \
+    -N -s \
+    -e "SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA='${DB_NAME}'
+          AND TABLE_NAME='schema_migrations'
+          AND COLUMN_NAME='migration_id';")"
+
+  if [[ "${has_migration_id}" != "1" ]]; then
+    echo "schema_migrations exists but is missing migration_id; upgrading..."
+
+    # Find best source column name for migration id
+    local src_id=""
+    for c in migration_id id filename name version; do
+      local ok
+      ok="$(MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+        --host="${DB_HOST}" --port="${DB_PORT}" \
+        --user="${DB_MIGRATE_USER}" \
+        --database="${DB_NAME}" \
+        --protocol=tcp \
+        -N -s \
+        -e "SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='${DB_NAME}'
+              AND TABLE_NAME='schema_migrations'
+              AND COLUMN_NAME='${c}';")"
+      if [[ "$ok" == "1" ]]; then
+        src_id="$c"
+        break
+      fi
+    done
+
+    if [[ -z "$src_id" ]]; then
+      echo "ERROR: Unable to upgrade schema_migrations (no recognizable id column)."
+      echo "Run: mysql -e \"SHOW COLUMNS FROM ${DB_NAME}.schema_migrations;\" and inspect."
+      exit 1
+    fi
+
+    # Find best source timestamp column
+    local src_ts=""
+    for c in applied_at ran_at applied_on created_at; do
+      local ok
+      ok="$(MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+        --host="${DB_HOST}" --port="${DB_PORT}" \
+        --user="${DB_MIGRATE_USER}" \
+        --database="${DB_NAME}" \
+        --protocol=tcp \
+        -N -s \
+        -e "SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='${DB_NAME}'
+              AND TABLE_NAME='schema_migrations'
+              AND COLUMN_NAME='${c}';")"
+      if [[ "$ok" == "1" ]]; then
+        src_ts="$c"
+        break
+      fi
+    done
+
+    MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+      --host="${DB_HOST}" --port="${DB_PORT}" \
+      --user="${DB_MIGRATE_USER}" \
+      --database="${DB_NAME}" \
+      --protocol=tcp \
+      -e "
+        CREATE TABLE IF NOT EXISTS schema_migrations_new (
+          migration_id VARCHAR(255) NOT NULL PRIMARY KEY,
+          applied_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB;
+
+        INSERT IGNORE INTO schema_migrations_new (migration_id, applied_at)
+        SELECT ${src_id},
+               ${src_ts:-CURRENT_TIMESTAMP}
+        FROM schema_migrations;
+
+        RENAME TABLE schema_migrations TO schema_migrations_legacy,
+                     schema_migrations_new TO schema_migrations;
+      "
+
+    echo "schema_migrations upgraded (old saved as schema_migrations_legacy)."
+  fi
 
   echo "Applying pending migrations from ${MIGRATIONS_DIR}..."
   shopt -s nullglob
@@ -425,7 +510,6 @@ run_db_migrations() {
     local base
     base="$(basename "$f")"
 
-    # Skip if already applied
     local already
     already="$(MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
       --host="${DB_HOST}" --port="${DB_PORT}" \
