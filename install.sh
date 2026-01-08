@@ -13,9 +13,10 @@ set -euo pipefail
 #     - node-red-contrib-uibuilder
 # - MariaDB users created for localhost, 127.0.0.1, ::1 (IPv4+IPv6 bulletproof)
 # - Enforces passwords on every run to match db.env (ALTER USER ... IDENTIFIED BY)
+# - Runs repo migrations with schema_migrations tracking (safe for upgrades)
 # - Warns if there are 0 rides (so codebook import returns clean 404 until UI creates rides)
 # =============================================================================
-INSTALLER_VERSION="v2.0.14"
+INSTALLER_VERSION="v2.0.15"
 
 # -----------------------------------------------------------------------------
 # Early logging buffer (before /opt/ridestatus exists)
@@ -385,6 +386,84 @@ for repo in "${REPOS[@]}"; do
 done
 
 echo
+
+# -----------------------------------------------------------------------------
+# DB migrations (idempotent, tracked)
+# -----------------------------------------------------------------------------
+run_db_migrations() {
+  local MIGRATIONS_DIR="${SRC_DIR}/ridestatus-server/migrations"
+
+  if [[ ! -d "$MIGRATIONS_DIR" ]]; then
+    echo "WARNING: migrations dir not found: $MIGRATIONS_DIR"
+    return 0
+  fi
+
+  echo "Ensuring schema_migrations table exists..."
+  MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+    --host="${DB_HOST}" --port="${DB_PORT}" \
+    --user="${DB_MIGRATE_USER}" \
+    --database="${DB_NAME}" \
+    --protocol=tcp \
+    -e "
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        migration_id VARCHAR(255) NOT NULL PRIMARY KEY,
+        applied_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB;
+    "
+
+  echo "Applying pending migrations from ${MIGRATIONS_DIR}..."
+  shopt -s nullglob
+  local files=("${MIGRATIONS_DIR}"/*.sql)
+  shopt -u nullglob
+
+  if (( ${#files[@]} == 0 )); then
+    echo "No migration files found."
+    return 0
+  fi
+
+  for f in "${files[@]}"; do
+    local base
+    base="$(basename "$f")"
+
+    # Skip if already applied
+    local already
+    already="$(MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+      --host="${DB_HOST}" --port="${DB_PORT}" \
+      --user="${DB_MIGRATE_USER}" \
+      --database="${DB_NAME}" \
+      --protocol=tcp \
+      -N -s \
+      -e "SELECT COUNT(*) FROM schema_migrations WHERE migration_id='${base}';")"
+
+    if [[ "${already}" == "1" ]]; then
+      echo "  [skip] ${base} (already applied)"
+      continue
+    fi
+
+    echo "  [run ] ${base}"
+    MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+      --host="${DB_HOST}" --port="${DB_PORT}" \
+      --user="${DB_MIGRATE_USER}" \
+      --database="${DB_NAME}" \
+      --protocol=tcp \
+      < "$f"
+
+    MYSQL_PWD="${DB_MIGRATE_PASS}" mysql \
+      --host="${DB_HOST}" --port="${DB_PORT}" \
+      --user="${DB_MIGRATE_USER}" \
+      --database="${DB_NAME}" \
+      --protocol=tcp \
+      -e "INSERT INTO schema_migrations (migration_id) VALUES ('${base}');"
+
+    echo "  [done] ${base}"
+  done
+
+  echo "DB migrations complete."
+  echo
+}
+
+echo "Running DB migrations..."
+run_db_migrations
 
 # -----------------------------------------------------------------------------
 # Node-RED install (ensure command exists)
